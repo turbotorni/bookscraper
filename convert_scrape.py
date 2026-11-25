@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""
-Convert the scraper output (dataset.json.gz: one JSON list, one record per book) into the
-data-contract files that extract_features.py reads:
-
-    books.parquet           book_id, title, author, author_birth, author_death, genre,
-                            downloads, n_words, is_anthology, text_path  (+ a few extra columns)
-    texts/<book_id>.txt     the book text (gutenberg_text_content)
-
-This is a STOP-GAP so P3 can work before P1's cleaned files exist. P1 owns the real genre
-mapping, anthology flag and download counts -- see the NOTES printed at the end.
-
-Usage:
-    python convert_scrape.py --input dataset.json.gz --out-dir data
-    python convert_scrape.py --input dataset.json.gz --out-dir data --limit 500   # dev kit
-"""
 import argparse
 import gzip
 import json
@@ -22,7 +7,6 @@ from pathlib import Path
 
 import pandas as pd
 
-# ---- placeholder genre mapping (first match wins; most specific first) -------------------
 GENRE_RULES = [
     ("Science Fiction", ["science fiction"]),
     ("Detective / Mystery", ["detective", "mystery", "mysteries"]),
@@ -31,7 +15,7 @@ GENRE_RULES = [
     ("Adventure", ["adventure"]),
     ("Poetry", ["poetry", "poems"]),
     ("Short Stories", ["short stories"]),
-    ("Fiction", ["fiction"]),           # any remaining "... -- Fiction" subject
+    ("Fiction", ["fiction"]),
 ]
 ANTHOLOGY_TITLE = re.compile(
     r"complete (works|poems|stories|novels)|collected (works|poems|stories)|"
@@ -41,7 +25,6 @@ _YEARS = re.compile(r",?\s*(?:ca\.\s*)?(\d{3,4})?\??\s*-\s*(?:ca\.\s*)?(\d{3,4})
 
 
 def parse_author(raw):
-    """'Still, Henry, 1920-' -> ('Still, Henry', 1920, None)"""
     if not raw:
         return None, None, None
     m = _YEARS.search(raw)
@@ -54,10 +37,11 @@ def parse_author(raw):
 
 
 def parse_downloads(raw):
-    """'359 downloads in the last 30 days.' -> 359  (NOTE: this is a 30-day count!)"""
-    if not raw:
+    if raw is None:
         return None
-    m = re.search(r"([\d,]+)\s+downloads?", str(raw))
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    m = re.search(r"([\d,]+)", str(raw))
     return int(m.group(1).replace(",", "")) if m else None
 
 
@@ -70,8 +54,16 @@ def map_genre(subjects):
 
 
 def iter_records(path):
-    """Stream the JSON list if ijson is installed (low memory), otherwise load it at once."""
-    opener = gzip.open if str(path).endswith((".gz", ".tmp")) else open
+    """Stream JSONL (.jsonl / .jsonl.gz) or JSON list (.json / .json.gz)."""
+    p_str = str(path)
+    opener = gzip.open if p_str.endswith((".gz", ".tmp")) else open
+    if ".jsonl" in p_str:
+        with opener(path, "rt", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+        return
     try:
         import ijson
         with opener(path, "rb") as fh:
@@ -100,6 +92,7 @@ def main():
         if bid is None:
             skipped["no_id"] += 1
             continue
+        bid = int(bid)
         if bid in seen:
             skipped["duplicate"] += 1
             continue
@@ -107,30 +100,47 @@ def main():
         if not text or not text.strip():
             skipped["no_text"] += 1
             continue
-        lang = rec.get("gutenberg_Language") or ""
-        if args.english_only and lang and "english" not in lang.lower():
+        lang = str(rec.get("gutenberg_Language") or "").strip().lower()
+        if args.english_only and lang and lang not in ("en", "english") and "english" not in lang:
             skipped["not_english"] += 1
             continue
         seen.add(bid)
 
         name, birth, death = parse_author(rec.get("gutenberg_Author"))
-        title = rec.get("gutenberg_Title") or rec.get("goodreads_title")
+        title = rec.get("gutenberg_Title") or rec.get("title")
         subjects = rec.get("gutenberg_subjects") or []
+        if isinstance(subjects, str):
+            subjects = [subjects]
+
+        genre = rec.get("main_category")
+        if not genre or str(genre).lower() in ("uncategorized", "none", "nan"):
+            genre = map_genre(subjects)
+
+        downloads = parse_downloads(rec.get("work_downloads_sum"))
+        if downloads is None:
+            downloads = parse_downloads(rec.get("gutenberg_Downloads"))
+
         path = out / "texts" / f"{bid}.txt"
         path.write_text(text, encoding="utf-8")
         rows.append({
-            "book_id": int(bid),
+            "book_id": bid,
             "title": title,
             "author": name,
             "author_birth": birth,
             "author_death": death,
-            "genre": map_genre(subjects),                       # placeholder, P1 owns this
-            "downloads": parse_downloads(rec.get("gutenberg_Downloads")),   # 30-day count!
+            "genre": genre,
+            "downloads": downloads,
             "n_words": len(text.split()),
             "is_anthology": bool((title and ANTHOLOGY_TITLE.search(title)) or name == "Various"),
             "text_path": str(Path("texts") / f"{bid}.txt"),
-            # extras (not in the contract, harmless):
-            "subjects": "; ".join(subjects),
+            # Extra P1/P2 columns preserved for P4 & P5:
+            "work_id": rec.get("work_id"),
+            "canonical_book_id": rec.get("canonical_book_id"),
+            "work_downloads_sum": rec.get("work_downloads_sum"),
+            "popularity_score": rec.get("popularity_score"),
+            "success_category": rec.get("success_category"),
+            "edition_count": rec.get("edition_count"),
+            "subjects": "; ".join(str(s) for s in subjects),
             "goodreads_rating": rec.get("goodreads_rating"),
             "goodreads_num_ratings": rec.get("goodreads_num_ratings"),
             "release_date": rec.get("gutenberg_Release Date"),
@@ -143,14 +153,8 @@ def main():
     df = pd.DataFrame(rows).sort_values("book_id").reset_index(drop=True)
     df.to_parquet(out / "books.parquet", index=False)
     print(f"\nwrote {len(df)} books to {out / 'books.parquet'}  (skipped: {skipped})")
-    print("books per placeholder genre:")
+    print("books per genre:")
     print(df["genre"].fillna("<none>").value_counts().to_string())
-    print("\nNOTES\n"
-          " * `downloads` is parsed from 'N downloads in the last 30 days' -> a 30-day count,\n"
-          "   NOT the all-time total the plan/paper use. Agree with the team what to use.\n"
-          " * genre / is_anthology are simple placeholder rules; P1 should replace them.\n"
-          " * goodreads_* fields can be matched to the wrong book (see 'Slow Burn'); do not\n"
-          "   rely on them without checking.")
 
 
 if __name__ == "__main__":
